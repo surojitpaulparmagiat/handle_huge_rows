@@ -365,6 +365,7 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG)  {
         await connection.query('SET foreign_key_checks = 0');
         await connection.query('SET unique_checks = 0');
         await connection.query('SET autocommit = 0');
+        // todo: disable the indexes if needed
 
         let totalRowsInserted = 0;
 
@@ -391,6 +392,7 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG)  {
                 totalRowsInserted += rowsAffected;
             } catch (err) {
                 console.error(`Error loading ${path.basename(filePath)}:`, err.message);
+                // todo: write row wise error logging if needed
             }
         }
 
@@ -411,6 +413,10 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG)  {
             await connection.end();
         }
     }
+
+
+    // todo: update the invalid rows logging mechanism if needed
+    // todo: try with excel converted to csv before actual usage
 }
 
 // Simple usage example from local CSV file
@@ -431,3 +437,5 @@ module.exports = {
     parseAndCreateCSV,
     loadCSVFilesToMySQL,
 };
+
+// s3 path : audit_file_id/csv_names.csv

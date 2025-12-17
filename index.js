@@ -40,7 +40,7 @@ const extractNegativeAuditNumber = (number) => {
 // Index = column position, Value = your custom key name
 const positionMappingArray = [
     'description',        // Position 0: First column (البيان)
-    'reference_number',   // Position 1: Second column (رقم القيد)
+    '',   // Position 1: Second column (رقم القيد)
     'issue_date',         // Position 2: Third column (Issue date)
     'transaction_number', // Position 3: Fourth column
     'account_name',       // Position 4: Fifth column
@@ -120,19 +120,26 @@ function transformRowByPosition(row, posMappingArray = positionMappingArray) {
 
     // Map values according to current column positions
     for (let i = 0; i < values.length; i++) {
-        const key = posMappingArray[i] || `col_${i}`;
+        const mappingKey = posMappingArray[i];
+
+        // If mapping key is an empty string or undefined/null, skip this column entirely
+        if (mappingKey === '') {
+            continue;
+        }
+
+        const key = mappingKey || `col_${i}`;
         transformedRow[key] = values[i];
     }
 
     // Compute amount from debit/credit fields
-    const amount_debit_raw  = transformedRow.amount_debit;
+    const amount_debit_raw = transformedRow.amount_debit;
     const amount_credit_raw = transformedRow.amount_credit;
 
     let amount;
     if (amount_debit_credit_same_column) {
         amount = numberParseFunction(amount_debit_raw);
     } else {
-        const amount_debit  = numberParseFunction(amount_debit_raw);
+        const amount_debit = numberParseFunction(amount_debit_raw);
         const amount_credit = numberParseFunction(amount_credit_raw);
         amount = Math.abs(amount_debit) - Math.abs(amount_credit);
     }
@@ -153,14 +160,14 @@ function transformRowByPosition(row, posMappingArray = positionMappingArray) {
     return transformedRow;
 }
 
-const maxRows = 10_00_000;
-const ROWS_PER_FILE = 1_00_000; // Create new CSV file every 20K rows
+const maxRows = 10_000;
+const ROWS_PER_FILE = 5_000; // Create new CSV file every 20K rows
 const TEMP_FOLDER = './temp';
 
 
 // Ensure temp folder exists
 if (!fs.existsSync(TEMP_FOLDER)) {
-    fs.mkdirSync(TEMP_FOLDER, { recursive: true });
+    fs.mkdirSync(TEMP_FOLDER, {recursive: true});
 }
 
 // Helper to convert JS values to MySQL LOAD DATA representation
@@ -197,16 +204,16 @@ async function writeBatchToCSV(rows, batchNumber) {
 
     // Map rows to ensure NULL-like values become \N for MySQL
     const safeRows = rows.map(r => ({
-        description:              toMysqlCsvValue(r.description),
-        reference_number:         toMysqlCsvValue(r.reference_number),
-        issue_date:               toMysqlCsvValue(r.issue_date),
-        transaction_number:       toMysqlCsvValue(r.transaction_number),
-        account_name:             toMysqlCsvValue(r.account_name),
-        account_number:           toMysqlCsvValue(r.account_number),
-        amount:                   toMysqlCsvValue(r.amount),
+        description: toMysqlCsvValue(r.description),
+        reference_number: toMysqlCsvValue(r.reference_number),
+        issue_date: toMysqlCsvValue(r.issue_date),
+        transaction_number: toMysqlCsvValue(r.transaction_number),
+        account_name: toMysqlCsvValue(r.account_name),
+        account_number: toMysqlCsvValue(r.account_number),
+        amount: toMysqlCsvValue(r.amount),
         trial_balance_account_id: toMysqlCsvValue(r.trial_balance_account_id),
-        transaction_type:         toMysqlCsvValue(r.transaction_type),
-        transaction_created_by:   toMysqlCsvValue(r.transaction_created_by),
+        transaction_type: toMysqlCsvValue(r.transaction_type),
+        transaction_created_by: toMysqlCsvValue(r.transaction_created_by),
     }));
 
     await csvWriter.writeRecords(safeRows);
@@ -314,8 +321,6 @@ async function loadCSVFilesToMySQL(csvFiles) {
 }
 
 
-
-
 async function readCSVFileWithStreaming(source, useMapping = true) {
     return new Promise((resolve, reject) => {
         let stream;
@@ -352,7 +357,7 @@ async function readCSVFileWithStreaming(source, useMapping = true) {
                         : row;
 
                     // Validate the row
-                    const { error } = SamplingSourceDataValidationSchema.importValidation.validate(outputRow, {
+                    const {error} = SamplingSourceDataValidationSchema.importValidation.validate(outputRow, {
                         allowUnknown: true,
                         abortEarly: false,
                         errors: {
@@ -364,7 +369,6 @@ async function readCSVFileWithStreaming(source, useMapping = true) {
                     });
 
                     if (error) {
-                        console.log("outputRow <>", outputRow)
                         mapped_invalid_rows.push({
                             rowNumber: rowCount,
                             row: outputRow,
@@ -463,7 +467,7 @@ async function readCSVFileWithStreaming(source, useMapping = true) {
             }
 
             console.log('\n✅ CSV file processing completed.\n');
-            resolve({ filesCreated, validRows: mapped_rows.length, invalidRows: mapped_invalid_rows.length });
+            resolve({filesCreated, validRows: mapped_rows.length, invalidRows: mapped_invalid_rows.length});
         };
     });
 }
@@ -498,7 +502,6 @@ async function readFile(source, useMapping = true) {
         throw new Error(`Unsupported file type: ${ext}. Supported types: .csv`);
     }
 }
-
 
 
 // Execute the function
@@ -550,15 +553,14 @@ readFromS3();
 */
 
 
-
-class SamplingSourceDataValidationSchema{
+class SamplingSourceDataValidationSchema {
     static importValidation = Joi.object({
         // for each transaction, these fields are mandatory
-        account_name : Joi.string().required().trim().max(100).label('Account name'),
-        account_number : Joi.string().required().trim().max(25).label('Account number'),
-        transaction_number : Joi.string().required().max(30).trim().label('Transaction number'),
-        amount : Joi.number().required().label('Amount'),
-        issue_date : Joi.date().required().label('Issue date').messages({
+        account_name: Joi.string().required().trim().max(100).label('Account name'),
+        account_number: Joi.string().required().trim().max(25).label('Account number'),
+        transaction_number: Joi.string().required().max(30).trim().label('Transaction number'),
+        amount: Joi.number().required().label('Amount'),
+        issue_date: Joi.date().required().label('Issue date').messages({
             'date.base': 'Issue date must be a valid date and should be in chosen format',
         }),
     }).unknown(true); // Allow unknown keys

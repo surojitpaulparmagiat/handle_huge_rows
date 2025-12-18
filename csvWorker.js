@@ -1,10 +1,10 @@
 const {Readable} = require('stream');
 const fs = require('fs');
-const path = require('path');
 const {DateTime} = require('luxon');
 const Joi = require('joi');
-const createCsvWriter = require('csv-writer').createObjectCsvWriter;
+const { createObjectCsvStringifier } = require('csv-writer');
 const fastCsv = require('@fast-csv/parse');
+const { storeFileInTemp } = require('./s3');
 
 const positionMappingArray = [
     'description',
@@ -19,26 +19,37 @@ const positionMappingArray = [
 ];
 
 const amount_debit_credit_same_column = false;
-const ROWS_PER_FILE = 1_00_000;
-const TEMP_FOLDER = './temp';
-
-if (!fs.existsSync(TEMP_FOLDER)) {
-    fs.mkdirSync(TEMP_FOLDER, {recursive: true});
-}
+const ROWS_PER_FILE = 50_000;
 
 class SamplingSourceDataValidationSchema {
     static importValidation = Joi.object({
-        account_name: Joi.string().required().trim().max(100).label('Account name'),
-        account_number: Joi.string().required().trim().max(25).label('Account number'),
-        transaction_number: Joi.string().required().max(30).trim().label('Transaction number'),
-        amount: Joi.number().required().label('Amount'),
+        account_name: Joi.string().required().trim().max(100).label('Account name').messages({
+            'string.empty': 'Account name is not allowed to be empty',
+            'any.required': 'Account name is required',
+            'string.max': 'Account name must be less than or equal to 100 characters',
+        }),
+        account_number: Joi.string().required().trim().max(25).label('Account number').messages({
+            'string.empty': 'Account number is not allowed to be empty',
+            'any.required': 'Account number is required',
+            'string.max': 'Account number must be less than or equal to 25 characters',
+        }),
+        transaction_number: Joi.string().required().max(30).trim().label('Transaction number').messages({
+            'string.empty': 'Transaction number is not allowed to be empty',
+            'any.required': 'Transaction number is required',
+            'string.max': 'Transaction number must be less than or equal to 30 characters',
+        }),
+        amount: Joi.number().required().label('Amount').messages({
+            'number.base': 'Amount must be a number',
+            'any.required': 'Amount is required',
+        }),
         issue_date: Joi.date().required().label('Issue date').messages({
             'date.base': 'Issue date must be a valid date and should be in chosen format',
+            'any.required': 'Issue date is required',
         }),
     }).unknown(true);
 }
 
-async function parseAndCreateCSVWorker({source, options = {}, workerId = ''}) {
+async function parseAndCreateCSVWorker({source, options = {}, workerId = '', folderSlug}) {
     const {
         useMapping = true,
         posMappingArray = positionMappingArray,
@@ -178,24 +189,8 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = ''}) {
             if (!rows || rows.length === 0) return null;
 
             const fileName = `${workerPrefix}CSV_${batchNo}.csv`;
-            const filePath = path.join(TEMP_FOLDER, fileName);
 
-            const csvWriter = createCsvWriter({
-                path: filePath,
-                header: [
-                    {id: 'description', title: 'description'},
-                    {id: 'reference_number', title: 'reference_number'},
-                    {id: 'issue_date', title: 'issue_date'},
-                    {id: 'transaction_number', title: 'transaction_number'},
-                    {id: 'account_name', title: 'account_name'},
-                    {id: 'account_number', title: 'account_number'},
-                    {id: 'amount', title: 'amount'},
-                    {id: 'trial_balance_account_id', title: 'trial_balance_account_id'},
-                    {id: 'transaction_type', title: 'transaction_type'},
-                    {id: 'transaction_created_by', title: 'transaction_created_by'},
-                ],
-            });
-
+            // Build safe rows for CSV
             const safeRows = rows.map((r) => ({
                 description: toMysqlCsvValue(r.description),
                 reference_number: toMysqlCsvValue(r.reference_number),
@@ -209,31 +204,28 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = ''}) {
                 transaction_created_by: toMysqlCsvValue(r.transaction_created_by),
             }));
 
-            await csvWriter.writeRecords(safeRows);
-            return filePath;
-        };
-
-        const writeInvalidRowsToCSV = async (invalidRows) => {
-            if (!invalidRows || invalidRows.length === 0) return null;
-
-            const fileName = `${workerPrefix}INVALID_ROWS.csv`;
-            const filePath = path.join(TEMP_FOLDER, fileName);
-
-            const csvWriter = createCsvWriter({
-                path: filePath,
+            // Use in-memory CSV stringifier and upload directly to S3
+            const stringifier = createObjectCsvStringifier({
                 header: [
-                    {id: 'row_number', title: 'row_number'},
-                    {id: 'error_reason', title: 'error_reason'},
+                    { id: 'description', title: 'description' },
+                    { id: 'reference_number', title: 'reference_number' },
+                    { id: 'issue_date', title: 'issue_date' },
+                    { id: 'transaction_number', title: 'transaction_number' },
+                    { id: 'account_name', title: 'account_name' },
+                    { id: 'account_number', title: 'account_number' },
+                    { id: 'amount', title: 'amount' },
+                    { id: 'trial_balance_account_id', title: 'trial_balance_account_id' },
+                    { id: 'transaction_type', title: 'transaction_type' },
+                    { id: 'transaction_created_by', title: 'transaction_created_by' },
                 ],
             });
 
-            const formattedRows = invalidRows.map((item) => ({
-                row_number: item.rowNumber,
-                error_reason: item.error,
-            }));
+            const csvContent = stringifier.getHeaderString() + stringifier.stringifyRecords(safeRows);
+            const buffer = Buffer.from(csvContent, 'utf8');
 
-            await csvWriter.writeRecords(formattedRows);
-            return filePath;
+            // Upload to S3 under the temp folder slug and return the S3 key
+            await storeFileInTemp(folderSlug, buffer, fileName);
+            return `upload/${folderSlug}/${fileName}`;
         };
 
         const printSummary = async () => {
@@ -251,14 +243,11 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = ''}) {
                 if (filePath) filesCreated.push(filePath);
             }
 
-            if (mapped_invalid_rows.length > 0) {
-                await writeInvalidRowsToCSV(mapped_invalid_rows);
-            }
-
             const summary = {
                 filesCreated,
                 validRows: mapped_rows.length,
                 invalidRows: mapped_invalid_rows.length,
+                invalidRowsData: mapped_invalid_rows, // Return actual invalid rows data
             };
 
             console.timeEnd(`parseAndCreateCSV[worker:${workerId || 'single'}]`);
@@ -277,6 +266,10 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = ''}) {
             .on('data', (row) => {
                 rowCount++;
                 const outputRow = useMapping ? transformRowByPosition(row) : row;
+
+                if(rowCount<=1){
+                    console.log("outputRow" , outputRow)
+                }
 
                 const validateThisRow = rowCount <= VALIDATION_SAMPLE_LIMIT;
                 if (validateThisRow) {

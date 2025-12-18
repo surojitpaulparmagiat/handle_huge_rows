@@ -9,6 +9,7 @@
   },
   "private": true,
   "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.954.0",
     "@aws-sdk/credential-provider-node": "^3.954.0",
     "@fast-csv/parse": "^4.3.6",
     "aws-sdk": "^2.1693.0",

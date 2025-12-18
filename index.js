@@ -2,89 +2,37 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const Piscina = require('piscina');
-const AWS = require('aws-sdk');
-const { defaultProvider } = require("@aws-sdk/credential-provider-node");
+const mysql = require('mysql2/promise');
+const { createObjectCsvStringifier } = require('csv-writer');
+const { storeFileInTemp, readFileFromTemp, s3FullUri} = require('./s3');
 require('dotenv').config();
-const AWS_DEFAULT_REGION = `${process.env.AWS_DEFAULT_REGION}`;
 
-
-AWS.config.update({
-    defaultProvider,
-    region: AWS_DEFAULT_REGION,
-});
-const AWS_S3_SERVICE = (bucket_access_type = 'private') => {
-    const S3_REGION = `${process.env.S3_REGION}`;
-    const S3_BUCKET_NAME_PRIVATE = `${process.env.S3_BUCKET_NAME_PRIVATE}`;
-    const S3_BUCKET_NAME_PUBLIC = `${process.env.S3_BUCKET_NAME_PUBLIC}`;
-
-    return new AWS.S3({
-        region: S3_REGION,
-        params: { Bucket: ('private' === bucket_access_type ? S3_BUCKET_NAME_PRIVATE : S3_BUCKET_NAME_PUBLIC) },
-        signatureVersion: 'v4',
-    });
-}
-const storeFileInTemp = async (folder_slug, file_buffer, file_name) => {
-    try {
-        const OneAuditS3 = AWS_S3_SERVICE("private");
-        const params = {
-            Key: `upload/${TEMP_FOLDER_SLUG}/${file_name}`,
-            Body: file_buffer,
-        };
-        console.log("params", params, file_name, TEMP_FOLDER_SLUG )
-        await OneAuditS3.upload(params).promise();
-    } catch (err) {
-        console.error('Error uploading file:', err);
-        throw new Error('Error uploading file to temp storage');
-    }
-
-}
-const readFileFromTemp = async (folder_slug, file_name) => {
-
-    try {
-        const OneAuditS3 = AWS_S3_SERVICE("private");
-        const params = {
-            Key: `upload/${folder_slug}/${file_name}`,
-        };
-        const response_data = await OneAuditS3.getObject(params).promise();
-        return response_data.Body;
-    } catch (err) {
-        console.error('Error uploading file:', err);
-        throw Error('Error reading file from temp storage');
-    }
-
-
-};
-
-
-
-
-
-
-
-
+const db_user = process.env.MYSQL_USER;
+const db_password = process.env.MYSQL_PASSWORD;
+const db_host = process.env.MYSQL_WRITE_HOST;
+const db_name = process.env.MYSQL_DATABASE;
 
 // MySQL Database Configuration
 const DB_CONFIG = {
-    host: 'localhost',
+    host: db_host,
     port: 3306,
-    user: 'root',
-    password: 'password',
-    database: '1audittest',
+    user: db_user,
+    password: db_password,
+    database: db_name,
 };
+
+console.log("DB_CONFIG", DB_CONFIG)
+
+const table_name = 'temp_aud_source_data'; // todo: dynamic value
 const organization_id = 10000; // todo: dynamic value
 const audit_file_id =15000; // todo: dynamic value
 
 
-const random_folder_name = 100   //Math.random().toString(36).substring(2, 15);
+const random_folder_name = 200   //Math.random().toString(36).substring(2, 15);
 
 TEMP_FOLDER_SLUG = `${organization_id}/temp/${audit_file_id}/sampling_source_data/${random_folder_name}`;
 
 
-const TEMP_FOLDER = './temp';
-
-if (!fs.existsSync(TEMP_FOLDER)) {
-    fs.mkdirSync(TEMP_FOLDER, {recursive: true});
-}
 
 // Initialize a Piscina worker pool for CSV parsing
 const cpuCount = os.cpus().length || 1;
@@ -169,6 +117,7 @@ async function parseAndCreateCSV(sourceKey, options = {}) {
 
     // 3) Split buffer into newline-aligned slices, each with header
     const slices = splitCsvByRows(fileBuffer, partCountLocal);
+    console.log("slices", slices)
 
     // 4) Dispatch to workers
     const tasks = slices.map((sliceBuf, index) =>
@@ -176,17 +125,22 @@ async function parseAndCreateCSV(sourceKey, options = {}) {
             source: sliceBuf,
             options,
             workerId: `w_${index + 1}`,
+            folderSlug: `${TEMP_FOLDER_SLUG}/db_csv`, // note: a subfolder for db_csv files
         })
     );
 
     const results = await Promise.all(tasks);
+    console.log("results", results)
 
     // Merge worker results
     const merged = {
         filesCreated: [],
         validRows: 0,
         invalidRows: 0,
+        invalidRowsFile: null,
     };
+
+    const allInvalidRows = [];
 
     for (const r of results) {
         if (!r) continue;
@@ -195,6 +149,35 @@ async function parseAndCreateCSV(sourceKey, options = {}) {
         }
         merged.validRows += r.validRows || 0;
         merged.invalidRows += r.invalidRows || 0;
+
+        // Collect invalid rows data from all workers
+        if (r.invalidRowsData && Array.isArray(r.invalidRowsData) && r.invalidRowsData.length > 0) {
+            allInvalidRows.push(...r.invalidRowsData);
+        }
+    }
+
+    // Write a single consolidated invalid rows file to S3
+    if (allInvalidRows.length > 0) {
+        const fileName = 'INVALID_ROWS.csv';
+
+        const formattedRows = allInvalidRows.map((item) => ({
+            row_number: item.rowNumber,
+            error_reason: item.error,
+        }));
+
+        const stringifier = createObjectCsvStringifier({
+            header: [
+                { id: 'row_number', title: 'row_number' },
+                { id: 'error_reason', title: 'error_reason' },
+            ],
+        });
+
+        const csvContent = stringifier.getHeaderString() + stringifier.stringifyRecords(formattedRows);
+        const buffer = Buffer.from(csvContent, 'utf8');
+
+        await storeFileInTemp(TEMP_FOLDER_SLUG, buffer, fileName);
+        merged.invalidRowsFile = `upload/${TEMP_FOLDER_SLUG}/${fileName}`;
+        console.log(`Created consolidated invalid rows file: ${merged.invalidRowsFile}`);
     }
 
     console.timeEnd('parseAndCreateCSV');
@@ -220,21 +203,25 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
             infileStreamFactory: (p) => fs.createReadStream(p),
         });
 
+
+
+
         // Simple fast-bulk-load tuning: disable foreign key checks and non-unique indexes
-        await connection.query('SET GLOBAL local_infile = 1');
+        // await connection.query('SET GLOBAL local_infile = 1');
         await connection.query('SET autocommit = 0');
         await connection.query('SET foreign_key_checks = 0');
-        await connection.query('ALTER TABLE aud_source_data DISABLE KEYS');
+        await connection.query(`ALTER TABLE ${table_name} DISABLE KEYS`);
 
         let totalRowsInserted = 0;
 
         for (let i = 0; i < csvFiles.length; i++) {
             const filePath = csvFiles[i];
-            const absolutePath = path.resolve(filePath).replace(/\\/g, '/');
+            const s3_uri = s3FullUri(filePath);
+            console.log(`[loadCSVFilesToMySQL] Loading file ${i + 1}/${csvFiles.length}: ${s3_uri}`);
 
             const loadDataSQL = `
-                LOAD DATA LOCAL INFILE '${absolutePath}'
-                INTO TABLE aud_source_data
+                LOAD DATA FROM S3 '${s3_uri}'
+                INTO TABLE ${table_name}
                 FIELDS TERMINATED BY ','
                 ENCLOSED BY '"'
                 LINES TERMINATED BY '\n'
@@ -250,7 +237,7 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
             totalRowsInserted += rowsAffected;
         }
 
-        await connection.query('ALTER TABLE aud_source_data ENABLE KEYS');
+        await connection.query(`ALTER TABLE ${table_name} ENABLE KEYS`);
         await connection.query('SET foreign_key_checks = 1');
         await connection.query('COMMIT');
         await connection.query('SET autocommit = 1');
@@ -265,7 +252,7 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
             try {
                 await connection.query('ROLLBACK');
                 await connection.query('SET foreign_key_checks = 1');
-                await connection.query('ALTER TABLE aud_source_data ENABLE KEYS');
+                await connection.query(`ALTER TABLE ${table_name} ENABLE KEYS`);
                 await connection.query('SET autocommit = 1');
             } catch (cleanupErr) {
                 console.error('Error during cleanup after failure:', cleanupErr);
@@ -284,25 +271,27 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
 // Simple usage example from S3 temp storage
 (async () => {
     try {
-        const localFileName =  'One_million_rows.csv';
+        const localFileName = '10k_rows.csv' ; // 'One_million_rows.csv';
+        const s3Key = 'primary_source_file.csv';
 
         // Upload local file once to temp S3 storage under a known key
         // const localBuffer = fs.readFileSync(localFileName);
-        const s3Key = 'primary_source_file.csv';
-
-
         // await storeFileInTemp(TEMP_FOLDER_SLUG, localBuffer, s3Key);
-
-        // todo: try to read the file.
-        // console.log("file uploaded to temp S3 storage.");
 
 
         // Now parse from S3 (no local disk reads inside workers)
         const parseResult = await parseAndCreateCSV(s3Key);
+        console.log('Parse result:', parseResult);
 
-        // if (parseResult && parseResult.filesCreated && parseResult.filesCreated.length > 0) {
-        //     await loadCSVFilesToMySQL(parseResult.filesCreated);
-        // }
+        if (parseResult && parseResult.filesCreated && parseResult.filesCreated.length > 0) {
+            console.log(`Created ${parseResult.filesCreated.length} valid CSV file(s) in S3`);
+            console.log(`Valid rows: ${parseResult.validRows}`);
+            console.log(`Invalid rows: ${parseResult.invalidRows}`);
+            if (parseResult.invalidRowsFile) {
+                console.log(`Invalid rows file: ${parseResult.invalidRowsFile}`);
+            }
+            await loadCSVFilesToMySQL(parseResult.filesCreated);
+        }
     } catch (error) {
         console.error('Error in processing pipeline:', error);
     }
@@ -311,4 +300,6 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
 module.exports = {
     parseAndCreateCSV,
     loadCSVFilesToMySQL,
+    storeFileInTemp,
+    TEMP_FOLDER_SLUG,
 };

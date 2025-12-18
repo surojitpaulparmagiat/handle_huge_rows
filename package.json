@@ -9,11 +9,15 @@
   },
   "private": true,
   "dependencies": {
+    "@fast-csv/parse": "^4.3.6",
+    "aws-sdk": "^2.1693.0",
     "csv-parser": "^3.2.0",
     "csv-writer": "^1.6.0",
+    "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
     "joi": "^18.0.2",
     "luxon": "^3.7.2",
-    "mysql2": "^3.16.0"
+    "mysql2": "^3.16.0",
+    "piscina": "^4.7.0"
   }
 }

@@ -2,3 +2,7 @@
 /dist
 /.idea
 /temp/**/*.csv
+
+.env
+One_million_rows.csv
+/temp

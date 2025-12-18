@@ -16,7 +16,6 @@ const DB_CONFIG = {
     password: db_password,
     database: db_name,
 };
-console.log("DB_CONFIG", DB_CONFIG);
 
 (async () => {
     try {

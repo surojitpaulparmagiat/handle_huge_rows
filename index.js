@@ -28,7 +28,7 @@ const organization_id = 10000; // todo: dynamic value
 const audit_file_id =15000; // todo: dynamic value
 
 
-const random_folder_name = 200   //Math.random().toString(36).substring(2, 15);
+const random_folder_name = 100   //Math.random().toString(36).substring(2, 15);
 
 TEMP_FOLDER_SLUG = `${organization_id}/temp/${audit_file_id}/sampling_source_data/${random_folder_name}`;
 

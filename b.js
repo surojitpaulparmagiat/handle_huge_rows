@@ -1,38 +1,22 @@
-const mysql = require('mysql2/promise');
-const {createReadStream} = require("node:fs");
-
-require('dotenv').config();
-
-const db_user = process.env.MYSQL_USER;
-const db_password = process.env.MYSQL_PASSWORD;
-const db_host = process.env.MYSQL_WRITE_HOST;
-const db_name = process.env.MYSQL_DATABASE;
-
-// MySQL Database Configuration
-const DB_CONFIG = {
-    host: db_host,
-    port: 3306,
-    user: db_user,
-    password: db_password,
-    database: db_name,
-};
+const { getDbConnection } = require('./db_connection');
 
 (async () => {
     try {
-        const connection = await mysql.createConnection({
-            ...DB_CONFIG,
-            infileStreamFactory: (p) => createReadStream(p),
-        });
-        await connection.query('select 1+1 as result');
-        const d = await connection.query('SELECT count(*) from temp_aud_source_data');
-        console.log("d", d)
-        console.log("DB CONNECTED SUCCESSFULLY");
+        const connection = await getDbConnection();
+        const result = await connection.execute('SELECT COUNT(*) FROM temp_aud_source_data');
+        const result2 = await connection.execute('SELECT COUNT(*) FROM temp_aud_source_data_import_sessions');
+        await mig(connection);
+        console.log('result is: ', result);
+        console.log('result2 is: ', result2);
+        await connection.end();
+    } catch (error) {
+        console.log('DB CONNECTION ERROR: ', error.message);
     }
-    catch (error) {
-        console.log("error", error)
-        console.log("DB CONNECTION ERROR: ", error.message);
-    }
-
 })();
 
 
+
+async function mig(connection) {
+    const al = connection.execute(`alter table temp_aud_source_data_import_sessions add column progress_status json`);
+    // await connection.execute(`truncate table temp_aud_source_data`);
+}

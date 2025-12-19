@@ -6,9 +6,12 @@ const AWS_DEFAULT_REGION = `${process.env.AWS_DEFAULT_REGION}`;
 const S3_REGION = `${process.env.S3_REGION}`;
 const S3_BUCKET_NAME_PRIVATE = `${process.env.S3_BUCKET_NAME_PRIVATE}`;
 const S3_BUCKET_NAME_PUBLIC = `${process.env.S3_BUCKET_NAME_PUBLIC}`;
-const UPLOAD = process.env.UPLOAD !== '0';
 
-console.log("UPLOAD", UPLOAD)
+// minimal time logging helpers
+function ts() { return new Date().toISOString(); }
+function log(msg) { console.log(`[${ts()}] ${msg}`); }
+function since(startMs) { return `${Date.now() - startMs}ms`; }
+const upload= true; // set to false to skip actual uploads
 
 AWS.config.update({
     defaultProvider,
@@ -24,21 +27,28 @@ function AWS_S3_SERVICE(bucket_access_type = 'private') {
     });
 }
 
-async function storeFileInTemp(folder_slug, body, file_name) {
+async function storeFileInTemp(folder_slug, body, file_name, ) {
     const OneAuditS3 = AWS_S3_SERVICE('private');
     const key = `upload/${folder_slug}/${file_name}`;
-    console.log("file upload started ... ", key)
-    if (UPLOAD) {
+
+    const t = Date.now();
+    if (upload) {
         await OneAuditS3.upload({Key: key, Body: body}).promise();
+        // log(`storeFileInTemp: uploaded ${key} in ${since(t)} (bytes=${body ? body.length : 0})`);
+    } else {
+        log(`storeFileInTemp: skip upload for ${key}`);
     }
-    console.log("file upload end ... ", key)
+
     return key;
 }
 
 async function readFileFromTemp(folder_slug, file_name) {
     const OneAuditS3 = AWS_S3_SERVICE('private');
     const key = `upload/${folder_slug}/${file_name}`;
+    const t = Date.now();
     const res = await OneAuditS3.getObject({Key: key}).promise();
+    // log(`readFileFromTemp: fetched ${key} in ${since(t)} (bytes=${res && res.Body ? res.Body.length : 0})`);
+
     return res.Body;
 }
 

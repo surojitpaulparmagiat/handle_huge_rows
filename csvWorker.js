@@ -6,6 +6,11 @@ const { createObjectCsvStringifier } = require('csv-writer');
 const fastCsv = require('@fast-csv/parse');
 const { storeFileInTemp } = require('./s3');
 
+// minimal time logging helpers
+function ts() { return new Date().toISOString(); }
+function log(msg) { console.log(`[${ts()}] ${msg}`); }
+function since(startMs) { return `${Date.now() - startMs}ms`; }
+
 const positionMappingArray = [
     'description',
     '',
@@ -19,7 +24,7 @@ const positionMappingArray = [
 ];
 
 const amount_debit_credit_same_column = false;
-const ROWS_PER_FILE = 50_000;
+const ROWS_PER_FILE = 1_00_000;
 
 class SamplingSourceDataValidationSchema {
     static importValidation = Joi.object({
@@ -33,11 +38,11 @@ class SamplingSourceDataValidationSchema {
             'any.required': 'Account number is required',
             'string.max': 'Account number must be less than or equal to 25 characters',
         }),
-        transaction_number: Joi.string().required().max(30).trim().label('Transaction number').messages({
-            'string.empty': 'Transaction number is not allowed to be empty',
-            'any.required': 'Transaction number is required',
-            'string.max': 'Transaction number must be less than or equal to 30 characters',
-        }),
+        // transaction_number: Joi.string().required().max(30).trim().label('Transaction number').messages({
+        //     'string.empty': 'Transaction number is not allowed to be empty',
+        //     'any.required': 'Transaction number is required',
+        //     'string.max': 'Transaction number must be less than or equal to 30 characters',
+        // }),
         amount: Joi.number().required().label('Amount').messages({
             'number.base': 'Amount must be a number',
             'any.required': 'Amount is required',
@@ -61,7 +66,8 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
 
     const workerPrefix = workerId ? `${workerId}_` : '';
 
-    console.time(`parseAndCreateCSV[worker:${workerId || 'single'}]`);
+    const tWorker = Date.now();
+    log(`worker ${workerId || 'unknown'}: start`);
 
     return new Promise((resolve, reject) => {
         let stream;
@@ -84,7 +90,6 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
             return reject(new Error('Invalid source: must be a file path, Buffer/Uint8Array, or readable stream'));
         }
 
-
         const mapped_rows = [];
         const mapped_invalid_rows = [];
 
@@ -92,6 +97,7 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
         let batchNumber = 1;
         let filesCreated = [];
         let lastBatchWrittenAt = 0;
+        const pendingWrites = [];
 
         const extractNegativeAuditNumber = (number) => {
             if (number == null || number === '') return 0;
@@ -190,6 +196,7 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
 
             const fileName = `${workerPrefix}CSV_${batchNo}.csv`;
 
+            const tWrite = Date.now();
             // Build safe rows for CSV
             const safeRows = rows.map((r) => ({
                 description: toMysqlCsvValue(r.description),
@@ -225,6 +232,8 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
 
             // Upload to S3 under the temp folder slug and return the S3 key
             await storeFileInTemp(folderSlug, buffer, fileName);
+            log(`worker ${workerId || 'unknown'}: wrote ${fileName} (${rows.length} rows) in ${since(tWrite)}`);
+
             return `upload/${folderSlug}/${fileName}`;
         };
 
@@ -234,8 +243,13 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
 
             await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
 
+            // Ensure all in-flight batch writes complete before finalizing
+            try { await Promise.all(pendingWrites); } catch (e) { console.error('Error awaiting pending batch writes:', e); }
+
             const remainingRows = mapped_rows.length - lastBatchWrittenAt;
+
             if (remainingRows > 0) {
+
                 const filePath = await writeBatchToCSV(
                     mapped_rows.slice(lastBatchWrittenAt),
                     batchNumber,
@@ -250,15 +264,15 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
                 invalidRowsData: mapped_invalid_rows, // Return actual invalid rows data
             };
 
-            console.timeEnd(`parseAndCreateCSV[worker:${workerId || 'single'}]`);
+            log(`worker ${workerId || 'unknown'}: end in ${since(tWorker)} (valid=${summary.validRows}, invalid=${summary.invalidRows}, files=${filesCreated.length})`);
             resolve(summary);
         };
 
         stream
             .pipe(fastCsv.parse({
                 headers: true,
-                ignoreEmpty: true,
-                trim: true,
+                ignoreEmpty: false,
+                trim: false,
             }))
             .on('error', (error) => {
                 reject(error);
@@ -266,10 +280,6 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
             .on('data', (row) => {
                 rowCount++;
                 const outputRow = useMapping ? transformRowByPosition(row) : row;
-
-                if(rowCount<=1){
-                    console.log("outputRow" , outputRow)
-                }
 
                 const validateThisRow = rowCount <= VALIDATION_SAMPLE_LIMIT;
                 if (validateThisRow) {
@@ -295,8 +305,12 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
 
                 mapped_rows.push(outputRow);
 
+
                 const validRowsSinceLastWrite = mapped_rows.length - lastBatchWrittenAt;
                 if (validRowsSinceLastWrite >= ROWS_PER_FILE) {
+                    // console.log("batchNumber: ", batchNumber);
+                    // console.log("mapped_rows count: ", mapped_rows.length);
+
                     const currentBatchNumber = batchNumber;
                     const batchStart = lastBatchWrittenAt;
                     const batchEnd = mapped_rows.length;
@@ -305,13 +319,14 @@ async function parseAndCreateCSVWorker({source, options = {}, workerId = '', fol
                     batchNumber++;
 
                     const batchToWrite = mapped_rows.slice(batchStart, batchEnd);
-                    writeBatchToCSV(batchToWrite, currentBatchNumber)
+                    const p = writeBatchToCSV(batchToWrite, currentBatchNumber)
                         .then((filePath) => {
                             if (filePath) filesCreated.push(filePath);
                         })
                         .catch((err) => {
                             console.error(`Error writing batch ${currentBatchNumber}:`, err);
                         });
+                    pendingWrites.push(p);
                 }
             })
             .on('end', () => {

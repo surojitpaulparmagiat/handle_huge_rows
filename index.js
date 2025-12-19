@@ -2,135 +2,201 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const Piscina = require('piscina');
-const mysql = require('mysql2/promise');
 const { createObjectCsvStringifier } = require('csv-writer');
 const { storeFileInTemp, readFileFromTemp, s3FullUri} = require('./s3');
 require('dotenv').config();
+const { parse } = require('@fast-csv/parse');
 
-const db_user = process.env.MYSQL_USER;
-const db_password = process.env.MYSQL_PASSWORD;
-const db_host = process.env.MYSQL_WRITE_HOST;
-const db_name = process.env.MYSQL_DATABASE;
+// --- minimal time logging helpers ---
+function ts() { return new Date().toISOString(); }
+function log(msg) { console.log(`[${ts()}] ${msg}`); }
+function since(startMs) { return `${Date.now() - startMs}ms`; }
 
-// MySQL Database Configuration
-const DB_CONFIG = {
-    host: db_host,
-    port: 3306,
-    user: db_user,
-    password: db_password,
-    database: db_name,
-};
+const source_data_table_name = 'temp_aud_source_data';
+const import_session_table_name = 'temp_aud_source_data_import_sessions';
 
-console.log("DB_CONFIG", DB_CONFIG)
 
-const table_name = 'temp_aud_source_data'; // todo: dynamic value
+
 const organization_id = 10000; // todo: dynamic value
 const audit_file_id =15000; // todo: dynamic value
+const client_entity_id = 20000; // todo: dynamic value
+const audit_period = 5; // todo: dynamic value
+const user_id = 1; // todo: dynamic value
 
 
-const random_folder_name = 100   //Math.random().toString(36).substring(2, 15);
-
-TEMP_FOLDER_SLUG = `${organization_id}/temp/${audit_file_id}/sampling_source_data/${random_folder_name}`;
+const localFileName = '10K_rows.csv';
 
 
 
-// Initialize a Piscina worker pool for CSV parsing
-const cpuCount = os.cpus().length || 1;
-const partCount = Math.max(2, Math.floor(cpuCount / 2));
+
+const { getDbConnection } = require('./db_connection');
+
+
+
+const createImportSessionId = async ({})=>{
+    const query = `INSERT INTO ${import_session_table_name}
+    (organization_id, audit_file_id, client_entity_id, audit_period, updated_by, createdAt, updatedAt, progress)
+    VALUES (?, ?, ?, ?, ?, NOW(), NOW(), JSON_OBJECT('total',0, 'processed',0))`;
+    const conn = await getDbConnection();
+    try {
+        const [result] = await conn.execute(query, [
+            organization_id,
+            audit_file_id,
+            client_entity_id,
+            audit_period,
+            user_id,
+            user_id,
+        ]);
+        return result.insertId;
+    } catch (error) {
+        throw error;
+    }
+    finally {
+        if (conn) {
+            await conn.end();
+        }
+    }
+}
+
+const updateImportSessionProgress = async ({sessionId, total, processed, conn  })=>{
+    const query = `UPDATE ${import_session_table_name}
+    SET progress = JSON_OBJECT('total', ?, 'processed', ?), updatedAt = NOW()
+    WHERE id = ?`;
+    try {
+        await conn.execute(query, [
+            total,
+            processed,
+            sessionId,
+        ]);
+    } catch (error) {
+        console.log("Error updating import session progress:", error);
+    }
+
+}
+
+
+
+
 
 const csvPiscina = new Piscina({
     filename: path.resolve(__dirname, 'csvWorker.js'),
-    minThreads: Math.max(1, partCount),
-    maxThreads: cpuCount,
+    minThreads:2,
+    maxThreads: 2,
 });
 
 // ========== FUNCTION: splitCsvByRows ==========
-// Split a full CSV file buffer into `parts` slices on newline boundaries.
-// Each returned Buffer is prefixed with the original header line so every slice is a valid CSV.
-function splitCsvByRows(fileBuffer, parts) {
+
+
+// Split using fast-csv to parse rows correctly and then produce CSV chunk buffers with header
+async function splitCsvByRowsFast(fileBuffer, parts) {
     if (!fileBuffer || !fileBuffer.length || parts <= 1) {
         return [fileBuffer];
     }
 
-    const totalLength = fileBuffer.length;
-
-    // Find the end of the header (first \n). If not found, treat whole buffer as a single part.
+    // Determine header line (first line) by scanning to first \n
     let headerEnd = -1;
-    for (let i = 0; i < totalLength; i++) {
+    for (let i = 0; i < fileBuffer.length; i++) {
         if (fileBuffer[i] === 0x0a /* \n */) { headerEnd = i; break; }
     }
     if (headerEnd === -1) {
         return [fileBuffer];
     }
 
-    const header = fileBuffer.slice(0, headerEnd + 1); // include the newline
-    const body = fileBuffer.slice(headerEnd + 1);
+    const headerBuf = fileBuffer.slice(0, headerEnd + 1);
+    const bodyBuf = fileBuffer.slice(headerEnd + 1);
 
-    if (body.length === 0) {
-        // Only header present
-        return [header];
+    // Parse rows using fast-csv
+    const rows = await new Promise((resolve, reject) => {
+        const collected = [];
+        const stream = parse({ headers: false, ignoreEmpty: true, trim: true })
+            .on('error', reject)
+            .on('data', (row) => collected.push(row))
+            .on('end', () => resolve(collected));
+        stream.write(bodyBuf);
+        stream.end();
+    });
+
+
+    if (rows.length === 0) {
+        return [headerBuf];
     }
 
-    const bytesPerPart = Math.ceil(body.length / parts);
+    const partsClamped = Math.max(1, Math.min(parts, rows.length));
+    const targetRowsPerPart = Math.ceil(rows.length / partsClamped);
 
+    // Reconstruct CSV chunks with header + rows
     const slices = [];
-    let offset = 0;
-    while (offset < body.length) {
-        let tentativeEnd = offset + bytesPerPart;
-        if (tentativeEnd >= body.length) {
-            tentativeEnd = body.length;
-        } else {
-            // advance to next newline so we don't cut a line in half
-            let advanced = false;
-            for (let i = tentativeEnd; i < body.length; i++) {
-                if (body[i] === 0x0a /* \n */) { tentativeEnd = i + 1; advanced = true; break; }
+    let idx = 0;
+    while (idx < rows.length) {
+        const endIdx = Math.min(rows.length, idx + targetRowsPerPart);
+        const chunkRows = rows.slice(idx, endIdx);
+        // Convert rows back to CSV lines
+        const lines = chunkRows.map((cols) => cols.map((c) => {
+            // naive escape: wrap in quotes if contains comma or quote; double any internal quotes
+            const s = String(c ?? '');
+            const needsQuote = s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r');
+            if (needsQuote) {
+                return '"' + s.replace(/"/g, '""') + '"';
             }
-            if (!advanced) tentativeEnd = body.length;
-        }
-        const bodySlice = body.slice(offset, tentativeEnd);
-        // Prefix with header to make this a standalone CSV chunk
-        const combined = Buffer.concat([header, bodySlice]);
-        slices.push(combined);
-        offset = tentativeEnd;
+            return s;
+        }).join(',')).join('\n');
+        const withHeader = Buffer.concat([headerBuf, Buffer.from(lines + '\n', 'utf8')]);
+        slices.push(withHeader);
+        idx = endIdx;
     }
+    console.log("slices", slices)
 
     return slices;
 }
 
 // ========== FUNCTION 1: parseAndCreateCSV (S3-based) ==========
-async function parseAndCreateCSV(sourceKey, options = {}) {
+async function parseAndCreateCSV(sourceKey, options = {}, DB_CSV_FOLDER_SLUG, PRIMARY_FILE_FOLDER_SLUG) {
+    const tAll = Date.now();
+    log(`parseAndCreateCSV: start (sourceKey=${sourceKey})`);
 
-    console.time("readFileFromTemp");
     // 1) Read full file buffer from S3 temp storage (already uploaded)
-    const fileBuffer = await readFileFromTemp(TEMP_FOLDER_SLUG, sourceKey);
-    console.timeEnd("readFileFromTemp");
+    const tRead = Date.now();
+    const fileBuffer = await readFileFromTemp(PRIMARY_FILE_FOLDER_SLUG, sourceKey);
+    log(`readFileFromTemp done in ${since(tRead)} (bytes=${fileBuffer ? fileBuffer.length : 0})`);
 
-    console.time('parseAndCreateCSV');
-    // 2) Decide how many parallel workers to use
-    const cpuCountLocal = os.cpus().length || 1;
-    const partCountLocal = Math.max(2, Math.floor(cpuCountLocal / 2));
+    // 2) Decide how many parallel workers to use (fixed to 4)
+    const partsToUse = 2;
 
     if (!fileBuffer || fileBuffer.length === 0) {
-        console.timeEnd('parseAndCreateCSV');
+        log(`parseAndCreateCSV: empty buffer, returning`);
         return { filesCreated: [], validRows: 0, invalidRows: 0 };
     }
 
     // 3) Split buffer into newline-aligned slices, each with header
-    const slices = splitCsvByRows(fileBuffer, partCountLocal);
-    console.log("slices", slices)
+    const tSplit = Date.now();
+    const slices = await splitCsvByRowsFast(fileBuffer, partsToUse);
+    log(`splitCsvByRows -> ${slices.length} slices in ${since(tSplit)}`);
 
+    // Sanity check: verify total rows preserved (count of \n, excluding header lines)
+    try {
+        const countNewlines = (buf) => {
+            let c = 0; for (let i = 0; i < buf.length; i++) { if (buf[i] === 0x0a) c++; } return c;
+        };
+        const totalRows = Math.max(0, countNewlines(fileBuffer) - 1);
+        let slicedRows = 0;
+        for (const s of slices) {
+            slicedRows += Math.max(0, countNewlines(s) - 1);
+        }
+        log(`row-count check: original=${totalRows}, after-split=${slicedRows}`);
+    } catch (_) {}
     // 4) Dispatch to workers
+    const tWorkers = Date.now();
     const tasks = slices.map((sliceBuf, index) =>
         csvPiscina.run({
             source: sliceBuf,
             options,
             workerId: `w_${index + 1}`,
-            folderSlug: `${TEMP_FOLDER_SLUG}/db_csv`, // note: a subfolder for db_csv files
+            folderSlug: `${DB_CSV_FOLDER_SLUG}/db_csv`, // note: a subfolder for db_csv files
         })
     );
 
     const results = await Promise.all(tasks);
-    console.log("results", results)
+    log(`worker processing finished in ${since(tWorkers)}`);
 
     // Merge worker results
     const merged = {
@@ -158,6 +224,7 @@ async function parseAndCreateCSV(sourceKey, options = {}) {
 
     // Write a single consolidated invalid rows file to S3
     if (allInvalidRows.length > 0) {
+        const tInvalid = Date.now();
         const fileName = 'INVALID_ROWS.csv';
 
         const formattedRows = allInvalidRows.map((item) => ({
@@ -175,53 +242,54 @@ async function parseAndCreateCSV(sourceKey, options = {}) {
         const csvContent = stringifier.getHeaderString() + stringifier.stringifyRecords(formattedRows);
         const buffer = Buffer.from(csvContent, 'utf8');
 
-        await storeFileInTemp(TEMP_FOLDER_SLUG, buffer, fileName);
-        merged.invalidRowsFile = `upload/${TEMP_FOLDER_SLUG}/${fileName}`;
-        console.log(`Created consolidated invalid rows file: ${merged.invalidRowsFile}`);
+        await storeFileInTemp(DB_CSV_FOLDER_SLUG, buffer, fileName, true);
+        log(`INVALID_ROWS.csv written (${formattedRows.length} rows) in ${since(tInvalid)}`);
+        merged.invalidRowsFile = `upload/${DB_CSV_FOLDER_SLUG}/${fileName}`;
     }
 
-    console.timeEnd('parseAndCreateCSV');
+    log(`parseAndCreateCSV: done in ${since(tAll)} (validRows=${merged.validRows}, invalidRows=${merged.invalidRows}, filesCreated=${merged.filesCreated.length})`);
     return merged;
 }
 
 // ========== FUNCTION 2: loadCSVFilesToMySQL ==========
-async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
-    console.log("csvFiles ..", csvFiles)
+async function loadCSVFilesToMySQL(csvFiles, sessionId ) {
     if (!csvFiles || csvFiles.length === 0) {
-        console.log('[loadCSVFilesToMySQL] No CSV files to load');
-        return 0;
+        return { inserted: 0, warnings: [] };
     }
 
-    let connection;
+    const connection = await getDbConnection()
+    // Create a separate connection for progress updates with autocommit ON
+    const progressConn = await getDbConnection();
+    await progressConn.query('SET autocommit = 1');
+
+    const tAll = Date.now();
+    log(`loadCSVFilesToMySQL: start (files=${csvFiles.length})`);
+
+    const warningsLog = [];
 
     try {
-        console.time('loadCSVFilesToMySQL');
-        console.log(`[loadCSVFilesToMySQL] Preparing to load ${csvFiles.length} file(s) into MySQL`);
 
-        connection = await mysql.createConnection({
-            ...dbConfig,
-            infileStreamFactory: (p) => fs.createReadStream(p),
-        });
+        // Initialize progress using the progress connection
+        await updateImportSessionProgress({
+            sessionId: sessionId,
+            total: csvFiles.length,
+            processed: 0,
+            conn: progressConn,
+        }).catch(() => {});
 
-
-
-
-        // Simple fast-bulk-load tuning: disable foreign key checks and non-unique indexes
-        // await connection.query('SET GLOBAL local_infile = 1');
         await connection.query('SET autocommit = 0');
         await connection.query('SET foreign_key_checks = 0');
-        await connection.query(`ALTER TABLE ${table_name} DISABLE KEYS`);
+        // removed MyISAM-specific DISABLE KEYS
 
         let totalRowsInserted = 0;
 
         for (let i = 0; i < csvFiles.length; i++) {
             const filePath = csvFiles[i];
             const s3_uri = s3FullUri(filePath);
-            console.log(`[loadCSVFilesToMySQL] Loading file ${i + 1}/${csvFiles.length}: ${s3_uri}`);
 
             const loadDataSQL = `
                 LOAD DATA FROM S3 '${s3_uri}'
-                INTO TABLE ${table_name}
+                INTO TABLE ${source_data_table_name}
                 FIELDS TERMINATED BY ','
                 ENCLOSED BY '"'
                 LINES TERMINATED BY '\n'
@@ -232,36 +300,58 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
                 SET source_data_import_session_id = 1, createdAt = NOW(), updatedAt = NOW()
             `;
 
+            const tOne = Date.now();
             const [result] = await connection.query(loadDataSQL);
             const rowsAffected = result.affectedRows || 0;
             totalRowsInserted += rowsAffected;
+            log(`Loaded file ${i + 1}/${csvFiles.length} from S3 in ${since(tOne)} (+${rowsAffected} rows)`);
+
+            // Update import session progress using separate autocommit connection
+            try {
+                await updateImportSessionProgress({
+                    sessionId: sessionId,
+                    total: csvFiles.length,
+                    processed: i + 1,
+                    conn: progressConn,
+                });
+            } catch (e) {
+                console.log('Progress update failed for file', i + 1, e?.message || e);
+            }
+
+            if (result && result.warningStatus && result.warningStatus > 0) {
+                const tWarn = Date.now();
+                const [warnings] = await connection.query('SHOW WARNINGS LIMIT 50');
+                log(`MySQL warnings (${warnings.length}) for file ${i + 1}: in ${since(tWarn)}`);
+                for (const w of warnings) {
+                    warningsLog.push({ file_name: filePath, message: w.Message });
+                }
+            }
+
         }
 
-        await connection.query(`ALTER TABLE ${table_name} ENABLE KEYS`);
+        // removed MyISAM-specific ENABLE KEYS
         await connection.query('SET foreign_key_checks = 1');
         await connection.query('COMMIT');
         await connection.query('SET autocommit = 1');
 
-        console.log(`[loadCSVFilesToMySQL] Total rows inserted: ${totalRowsInserted}`);
-        console.timeEnd('loadCSVFilesToMySQL');
-
-        return totalRowsInserted;
-    } catch (error) {
-        console.error('Database error during bulk load:', error);
+        log(`loadCSVFilesToMySQL: committed in ${since(tAll)} (totalRowsInserted=${totalRowsInserted}, warnings=${warningsLog.length})`);
+        return { inserted: totalRowsInserted, warnings: warningsLog };
+    }
+    catch (error) {
         if (connection) {
             try {
                 await connection.query('ROLLBACK');
                 await connection.query('SET foreign_key_checks = 1');
-                await connection.query(`ALTER TABLE ${table_name} ENABLE KEYS`);
                 await connection.query('SET autocommit = 1');
-            } catch (cleanupErr) {
-                console.error('Error during cleanup after failure:', cleanupErr);
-            }
+            } catch (cleanupErr) {}
         }
         throw error;
     } finally {
         if (connection) {
             await connection.end();
+        }
+        if (progressConn) {
+            try { await progressConn.end(); } catch (_) {}
         }
     }
 }
@@ -270,36 +360,55 @@ async function loadCSVFilesToMySQL(csvFiles, dbConfig = DB_CONFIG) {
 
 // Simple usage example from S3 temp storage
 (async () => {
+    const tAll = Date.now();
     try {
-        const localFileName = '10k_rows.csv' ; // 'One_million_rows.csv';
         const s3Key = 'primary_source_file.csv';
+        log('Script start');
 
+        const sessionId = await createImportSessionId({});
+        log(`Created import session ID: ${sessionId}`);
+
+        const random_folder_name = `S${sessionId}`
+        const tUpload = Date.now();
+        const localBuffer = fs.readFileSync(localFileName);
+
+        const PRIMARY_FILE_FOLDER_SLUG =  `${organization_id}/temp/${audit_file_id}/sampling_source_data`;
         // Upload local file once to temp S3 storage under a known key
-        // const localBuffer = fs.readFileSync(localFileName);
-        // await storeFileInTemp(TEMP_FOLDER_SLUG, localBuffer, s3Key);
-
+        await storeFileInTemp(PRIMARY_FILE_FOLDER_SLUG, localBuffer, s3Key, true);
+        log(`Uploaded local file to temp S3 as ${s3Key} in ${since(tUpload)}`);
 
         // Now parse from S3 (no local disk reads inside workers)
-        const parseResult = await parseAndCreateCSV(s3Key);
-        console.log('Parse result:', parseResult);
-
+        const tParse = Date.now();
+        const DB_CSV_FOLDER_SLUG = `${organization_id}/temp/${audit_file_id}/sampling_source_data/${random_folder_name}`;
+        const parseResult = await parseAndCreateCSV(s3Key,{}, DB_CSV_FOLDER_SLUG, PRIMARY_FILE_FOLDER_SLUG);
+        log(`parseAndCreateCSV finished in ${since(tParse)}`);
+        //
         if (parseResult && parseResult.filesCreated && parseResult.filesCreated.length > 0) {
-            console.log(`Created ${parseResult.filesCreated.length} valid CSV file(s) in S3`);
-            console.log(`Valid rows: ${parseResult.validRows}`);
-            console.log(`Invalid rows: ${parseResult.invalidRows}`);
-            if (parseResult.invalidRowsFile) {
-                console.log(`Invalid rows file: ${parseResult.invalidRowsFile}`);
+            const tLoad = Date.now();
+            const { inserted, warnings } = await loadCSVFilesToMySQL(parseResult.filesCreated, sessionId);
+            log(`loadCSVFilesToMySQL finished in ${since(tLoad)} (inserted=${inserted})`);
+            if (warnings && warnings.length) {
+               await saveWarningsToS3(warnings, DB_CSV_FOLDER_SLUG);
             }
-            await loadCSVFilesToMySQL(parseResult.filesCreated);
         }
     } catch (error) {
-        console.error('Error in processing pipeline:', error);
+        console.error('Error:', error);
+    } finally {
+        log(`Script end in ${since(tAll)}`);
     }
 })();
 
+
+const saveWarningsToS3 = async (warnings, DB_CSV_FOLDER_SLUG) => {
+    // stringify warnings and save as JSON in S3
+    const warningsJson = JSON.stringify(warnings, null, 2);
+    const warningsBuffer = Buffer.from(warningsJson, 'utf8');
+    const warningsFileName = `WARNINGS.json`;
+    await storeFileInTemp(DB_CSV_FOLDER_SLUG, warningsBuffer, warningsFileName, true);
+    log(`Warnings JSON uploaded to S3 at upload/${DB_CSV_FOLDER_SLUG}/${warningsFileName}`);
+}
+
+
 module.exports = {
-    parseAndCreateCSV,
-    loadCSVFilesToMySQL,
     storeFileInTemp,
-    TEMP_FOLDER_SLUG,
 };

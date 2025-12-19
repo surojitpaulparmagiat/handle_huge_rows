@@ -4,6 +4,9 @@
 /temp/**/*.csv
 
 .env
-One_million_rows.csv
+one_million_rows.csv
+two_million_rows.csv
+five_million_rows.csv
+ten_million_rows.csv
 10k_rows.csv
 /temp
